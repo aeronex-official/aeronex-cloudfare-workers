@@ -85,23 +85,49 @@ async function getSession(openId, supabaseUrl, supabaseKey) {
 
 async function setSession(openId, products, supabaseUrl, supabaseKey) {
   try {
-    await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
-      method: 'POST',
-      headers: {
-        ...getSupabaseHeaders(supabaseKey),
-        'Prefer': 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify({
-        open_id: openId,
-        products: products,
-        updated_at: new Date().toISOString()
-      })
-    });
+    // 先尝试 PATCH 更新（如果记录已存在）
+    const patchResp = await fetch(
+      `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}`,
+      {
+        method: 'PATCH',
+        headers: {
+          ...getSupabaseHeaders(supabaseKey),
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          products: products,
+          updated_at: new Date().toISOString()
+        })
+      }
+    );
+
+    // 如果没有记录被更新（新用户），则 POST 插入
+    const count = patchResp.headers.get('content-range') || '';
+    if (count === '*/0' || count === '') {
+      const checkResp = await fetch(
+        `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}&select=id`,
+        { headers: getSupabaseHeaders(supabaseKey) }
+      );
+      const existing = await checkResp.json();
+      if (!existing || existing.length === 0) {
+        await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
+          method: 'POST',
+          headers: {
+            ...getSupabaseHeaders(supabaseKey),
+            'Prefer': 'return=minimal'
+          },
+          body: JSON.stringify({
+            open_id: openId,
+            products: products,
+            updated_at: new Date().toISOString()
+          })
+        });
+      }
+    }
   } catch (e) {
     // session 失败不影响主流程
   }
 }
-
 // ============================================================
 // 库存查询（查 Supabase）
 // ============================================================

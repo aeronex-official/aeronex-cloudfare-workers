@@ -1,10 +1,35 @@
 /**
- * AERONEX Lark Bot - Cloudflare Worker
- * Version: 2.0.0
- * 功能：接收 Lark 消息，查询 Supabase 库存数据
+ * AERONEX Lark Bot + Admin API - Cloudflare Worker
+ * Version: 2.1.0
+ * 功能：
+ *   - 接收 Lark 消息，查询 Supabase 库存数据
+ *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
+
+// ============================================================
+// CORS 工具
+// ============================================================
+
+function corsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Password',
+    'Access-Control-Max-Age': '86400'
+  };
+}
+
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...extraHeaders
+    }
+  });
+}
 
 // ============================================================
 // 工具函数
@@ -39,7 +64,6 @@ function isEan(keyword) {
 async function isEventProcessed(eventId, supabaseUrl, supabaseKey) {
   if (!eventId) return false;
   try {
-    // 查询是否存在
     const resp = await fetch(
       `${supabaseUrl}/rest/v1/processed_events?event_id=eq.${eventId}&select=id`,
       { headers: getSupabaseHeaders(supabaseKey) }
@@ -47,7 +71,6 @@ async function isEventProcessed(eventId, supabaseUrl, supabaseKey) {
     const data = await resp.json();
     if (data && data.length > 0) return true;
 
-    // 不存在则写入
     await fetch(`${supabaseUrl}/rest/v1/processed_events`, {
       method: 'POST',
       headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
@@ -72,7 +95,6 @@ async function getSession(openId, supabaseUrl, supabaseKey) {
     const data = await resp.json();
     if (!data || data.length === 0) return [];
 
-    // 检查是否过期（5分钟）
     const updatedAt = new Date(data[0].updated_at).getTime();
     const now = Date.now();
     if (now - updatedAt > 5 * 60 * 1000) return [];
@@ -85,23 +107,15 @@ async function getSession(openId, supabaseUrl, supabaseKey) {
 
 async function setSession(openId, products, supabaseUrl, supabaseKey) {
   try {
-    // 先尝试 PATCH 更新（如果记录已存在）
     const patchResp = await fetch(
       `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}`,
       {
         method: 'PATCH',
-        headers: {
-          ...getSupabaseHeaders(supabaseKey),
-          'Prefer': 'return=minimal'
-        },
-        body: JSON.stringify({
-          products: products,
-          updated_at: new Date().toISOString()
-        })
+        headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
+        body: JSON.stringify({ products, updated_at: new Date().toISOString() })
       }
     );
 
-    // 如果没有记录被更新（新用户），则 POST 插入
     const count = patchResp.headers.get('content-range') || '';
     if (count === '*/0' || count === '') {
       const checkResp = await fetch(
@@ -112,15 +126,8 @@ async function setSession(openId, products, supabaseUrl, supabaseKey) {
       if (!existing || existing.length === 0) {
         await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
           method: 'POST',
-          headers: {
-            ...getSupabaseHeaders(supabaseKey),
-            'Prefer': 'return=minimal'
-          },
-          body: JSON.stringify({
-            open_id: openId,
-            products: products,
-            updated_at: new Date().toISOString()
-          })
+          headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
+          body: JSON.stringify({ open_id: openId, products, updated_at: new Date().toISOString() })
         });
       }
     }
@@ -128,6 +135,7 @@ async function setSession(openId, products, supabaseUrl, supabaseKey) {
     // session 失败不影响主流程
   }
 }
+
 // ============================================================
 // 库存查询（查 Supabase）
 // ============================================================
@@ -151,7 +159,6 @@ async function searchByModel(keyword, supabaseUrl, supabaseKey) {
   const filtered = rows.filter(r => r.model && r.model.toLowerCase().includes(kw));
   const products = mergeProducts(filtered);
 
-  // 排序：精确匹配 > 开头匹配 > 包含匹配
   products.sort((a, b) => {
     const am = a.model.toLowerCase();
     const bm = b.model.toLowerCase();
@@ -167,12 +174,7 @@ function mergeProducts(rows) {
     const ean = String(row.ean || '').trim();
     if (!ean) continue;
     if (!products[ean]) {
-      products[ean] = {
-        ean,
-        model: row.model || '',
-        dubai_qty: null,
-        saudi_qty: null
-      };
+      products[ean] = { ean, model: row.model || '', dubai_qty: null, saudi_qty: null };
     }
     const qty = row.available_qty ?? 0;
     if (row.warehouse && row.warehouse.includes('Dubai')) {
@@ -225,7 +227,6 @@ async function handleMessage(openId, keyword, supabaseUrl, supabaseKey) {
   keyword = keyword.trim();
   if (!keyword) return null;
 
-  // 判断是否为选择编号
   if (/^\d{1,2}$/.test(keyword)) {
     const num = parseInt(keyword);
     const session = await getSession(openId, supabaseUrl, supabaseKey);
@@ -238,7 +239,6 @@ async function handleMessage(openId, keyword, supabaseUrl, supabaseKey) {
     return '⚠️ 查询已过期，请重新输入产品名称或EAN码';
   }
 
-  // 判断是否为 EAN 码
   if (isEan(keyword)) {
     const products = await searchByEan(keyword, supabaseUrl, supabaseKey);
     if (!products.length) {
@@ -248,7 +248,6 @@ async function handleMessage(openId, keyword, supabaseUrl, supabaseKey) {
     return formatProductDetail(products[0]);
   }
 
-  // 型号关键词搜索
   const products = await searchByModel(keyword, supabaseUrl, supabaseKey);
   if (!products.length) {
     return `❌ 未找到与「${keyword}」相关的产品\n\n请尝试：\n• 输入完整 EAN 码（如：6937224106420）\n• 输入型号关键词（如：Zenmuse X7、Matrice 400）`;
@@ -273,23 +272,156 @@ async function sendReply(openId, text, token, isGroup, chatId) {
     await fetch(`${url}?receive_id_type=chat_id`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        receive_id: chatId,
-        msg_type: 'text',
-        content: JSON.stringify({ text })
-      })
+      body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) })
     });
   } else {
     await fetch(`${url}?receive_id_type=open_id`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        receive_id: openId,
-        msg_type: 'text',
-        content: JSON.stringify({ text })
-      })
+      body: JSON.stringify({ receive_id: openId, msg_type: 'text', content: JSON.stringify({ text }) })
     });
   }
+}
+
+// ============================================================
+// Admin API 路由处理
+// ============================================================
+
+async function handleAdminRequest(request, url, env) {
+  const origin = request.headers.get('Origin') || '*';
+  const cors = corsHeaders(origin);
+
+  // OPTIONS 预检
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: cors });
+  }
+
+  // 验证 Admin 密码
+  const adminPassword = request.headers.get('X-Admin-Password') || '';
+  if (!env.ADMIN_PASSWORD || adminPassword !== env.ADMIN_PASSWORD) {
+    return jsonResponse({ error: 'Unauthorized' }, 401, cors);
+  }
+
+  const supabaseUrl = env.SUPABASE_URL;
+  const supabaseKey = env.SUPABASE_SECRET_KEY; // 使用 service_role key 进行写操作
+  const headers = getSupabaseHeaders(supabaseKey);
+
+  const pathname = url.pathname;
+  const method = request.method;
+
+  // ── GET /api/admin/inventory ── 分页列表
+  if (method === 'GET' && pathname === '/api/admin/inventory') {
+    const page = parseInt(url.searchParams.get('page') || '1');
+    const limit = parseInt(url.searchParams.get('limit') || '500');
+    const search = url.searchParams.get('search') || '';
+    const warehouse = url.searchParams.get('warehouse') || '';
+    const offset = (page - 1) * limit;
+
+    let filter = '';
+    if (search) {
+      filter += `&or=(model.ilike.*${encodeURIComponent(search)}*,ean.ilike.*${encodeURIComponent(search)}*)`;
+    }
+    if (warehouse) {
+      filter += `&warehouse=eq.${encodeURIComponent(warehouse)}`;
+    }
+
+    // 获取总数
+    const countResp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?select=id${filter}`,
+      { headers: { ...headers, 'Prefer': 'count=exact', 'Range': '0-0' } }
+    );
+    const contentRange = countResp.headers.get('content-range') || '0-0/0';
+    const total = parseInt(contentRange.split('/')[1] || '0');
+
+    // 获取数据
+    const dataResp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?select=*${filter}&offset=${offset}&limit=${limit}&order=model.asc`,
+      { headers }
+    );
+    const data = await dataResp.json();
+
+    return jsonResponse({ data, total, page, limit }, 200, cors);
+  }
+
+  // ── GET /api/admin/inventory/:id ── 单条记录
+  const singleMatch = pathname.match(/^\/api\/admin\/inventory\/([^/]+)$/);
+  if (method === 'GET' && singleMatch) {
+    const id = singleMatch[1];
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?id=eq.${encodeURIComponent(id)}&select=*`,
+      { headers }
+    );
+    const data = await resp.json();
+    if (!data || data.length === 0) return jsonResponse({ error: 'Not found' }, 404, cors);
+    return jsonResponse(data[0], 200, cors);
+  }
+
+  // ── POST /api/admin/inventory ── 新增记录
+  if (method === 'POST' && pathname === '/api/admin/inventory') {
+    const body = await request.json();
+    const resp = await fetch(`${supabaseUrl}/rest/v1/inventory`, {
+      method: 'POST',
+      headers: { ...headers, 'Prefer': 'return=representation' },
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    return jsonResponse(Array.isArray(data) ? data[0] : data, 201, cors);
+  }
+
+  // ── PUT /api/admin/inventory/:id ── 全量更新
+  const putMatch = pathname.match(/^\/api\/admin\/inventory\/([^/]+)$/);
+  if (method === 'PUT' && putMatch) {
+    const id = putMatch[1];
+    const body = await request.json();
+    const resp = await fetch(`${supabaseUrl}/rest/v1/inventory?id=eq.${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Prefer': 'return=representation' },
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    return jsonResponse(Array.isArray(data) ? data[0] : data, 200, cors);
+  }
+
+  // ── DELETE /api/admin/inventory/:id ── 删除单条
+  const deleteMatch = pathname.match(/^\/api\/admin\/inventory\/([^/]+)$/);
+  if (method === 'DELETE' && deleteMatch) {
+    const id = deleteMatch[1];
+    await fetch(`${supabaseUrl}/rest/v1/inventory?id=eq.${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers
+    });
+    return new Response(null, { status: 204, headers: cors });
+  }
+
+  // ── POST /api/admin/inventory/batch-delete ── 批量删除（清空全表）
+  if (method === 'POST' && pathname === '/api/admin/inventory/batch-delete') {
+    await fetch(`${supabaseUrl}/rest/v1/inventory?id=neq.00000000-0000-0000-0000-000000000000`, {
+      method: 'DELETE',
+      headers
+    });
+    return jsonResponse({ success: true }, 200, cors);
+  }
+
+  // ── POST /api/admin/inventory/batch-insert ── 批量插入
+  if (method === 'POST' && pathname === '/api/admin/inventory/batch-insert') {
+    const body = await request.json();
+    const rows = body.rows || [];
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return jsonResponse({ error: 'rows array is required' }, 400, cors);
+    }
+    const resp = await fetch(`${supabaseUrl}/rest/v1/inventory`, {
+      method: 'POST',
+      headers: { ...headers, 'Prefer': 'return=minimal' },
+      body: JSON.stringify(rows)
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      return jsonResponse({ error: errText }, resp.status, cors);
+    }
+    return jsonResponse({ success: true, inserted: rows.length }, 200, cors);
+  }
+
+  return jsonResponse({ error: 'Not found' }, 404, cors);
 }
 
 // ============================================================
@@ -298,16 +430,30 @@ async function sendReply(openId, text, token, isGroup, chatId) {
 
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+    const origin = request.headers.get('Origin') || '*';
+
+    // ── Admin API 路由（/api/admin/*）──
+    if (pathname.startsWith('/api/admin/')) {
+      return handleAdminRequest(request, url, env);
+    }
+
+    // ── OPTIONS 预检（通用）──
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+    }
+
     const supabaseUrl = env.SUPABASE_URL;
     const supabaseKey = env.SUPABASE_SECRET_KEY;
     const larkAppId = env.LARK_APP_ID;
     const larkAppSecret = env.LARK_APP_SECRET;
 
-    // GET 健康检查
+    // ── GET 健康检查 ──
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.0.0'
+        version: '2.1.0'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -324,7 +470,7 @@ export default {
       });
     }
 
-    // URL verification
+    // URL verification（Lark 验证 Webhook）
     if (body.type === 'url_verification') {
       return new Response(JSON.stringify({ challenge: body.challenge }), {
         headers: { 'Content-Type': 'application/json' }
@@ -349,7 +495,6 @@ export default {
     const chatType = msg.chat_type || '';
     const msgType = msg.message_type || '';
 
-    // 只处理文本消息
     if (!['p2p', 'group'].includes(chatType) || msgType !== 'text') {
       return responsePromise;
     }
@@ -372,8 +517,6 @@ export default {
 
     if (!keyword || !openId) return responsePromise;
 
-    // 异步处理（不阻塞响应）
-    const ctx = { waitUntil: (p) => p };
     try {
       const token = await getLarkToken(larkAppId, larkAppSecret);
       const reply = await handleMessage(openId, keyword, supabaseUrl, supabaseKey);
@@ -381,7 +524,7 @@ export default {
         await sendReply(openId, reply, token, isGroup, chatId);
       }
     } catch (e) {
-      // 静默处理异常，不发送错误消息
+      // 静默处理异常
     }
 
     return responsePromise;

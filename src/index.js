@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.1.2
+ * Version: 2.1.3
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -8,7 +8,8 @@
  *   2.1.1 - 修复 setSession() 使用 UPSERT，解决多用户 session 丢失导致"查询已过期"的 Bug
  *   2.1.2 - 修复 searchByModel() encodeURIComponent 将 * 编码为 %2A，导致 ilike 通配符失效
  *           修复 mergeProducts() 改用 Map 替代普通 Object，避免纯数字 EAN key 被 V8 自动排序
- *           以上两处修复确保搜索列表顺序与 session 存储顺序严格一致，数字选择不再返回错误产品
+ *   2.1.3 - 修复 setSession() UPSERT 未指定 on_conflict=open_id，导致冲突时以主键判断
+ *           旧记录永远无法更新，session 停留在首次写入值，改为 DELETE + INSERT 彻底解决
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
@@ -111,18 +112,26 @@ async function getSession(openId, supabaseUrl, supabaseKey) {
 }
 
 async function setSession(openId, products, supabaseUrl, supabaseKey) {
+  // 策略：先 DELETE 该 open_id 的旧记录，再 INSERT 新记录
+  // 原因：Supabase UPSERT（resolution=merge-duplicates）默认以主键 id 判断冲突，
+  //       而非 open_id；指定 on_conflict=open_id 在 PostgREST v10 以下版本不稳定。
+  //       DELETE + INSERT 是最可靠的"存在则替换"实现，且操作均在独立事务中完成。
   try {
-    // 使用 Supabase UPSERT（POST + Prefer: resolution=merge-duplicates）
-    // open_id 存在 → UPDATE products + updated_at
-    // open_id 不存在 → INSERT 新记录
-    // 依赖 user_sessions.open_id 的 UNIQUE 约束（已在 Supabase 建立）
-    // 修复原因：旧的 PATCH → content-range 判断 → SELECT → INSERT 三步走逻辑
-    //   在 Supabase 返回 content-range 为 null 时判断失效，导致多用户 session 无法更新
+    // Step 1：删除该用户的旧 session（若不存在则无影响）
+    await fetch(
+      `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}`,
+      {
+        method: 'DELETE',
+        headers: getSupabaseHeaders(supabaseKey)
+      }
+    );
+
+    // Step 2：插入最新 session
     await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
       method: 'POST',
       headers: {
         ...getSupabaseHeaders(supabaseKey),
-        'Prefer': 'resolution=merge-duplicates,return=minimal'
+        'Prefer': 'return=minimal'
       },
       body: JSON.stringify({
         open_id: openId,
@@ -459,7 +468,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.1.2'
+        version: '2.1.3'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 

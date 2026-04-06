@@ -1,9 +1,11 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.1.0
+ * Version: 2.1.1
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
+ * Changelog:
+ *   2.1.1 - 修复 setSession() 使用 UPSERT，解决多用户 session 丢失导致"查询已过期"的 Bug
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
@@ -107,32 +109,26 @@ async function getSession(openId, supabaseUrl, supabaseKey) {
 
 async function setSession(openId, products, supabaseUrl, supabaseKey) {
   try {
-    const patchResp = await fetch(
-      `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}`,
-      {
-        method: 'PATCH',
-        headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
-        body: JSON.stringify({ products, updated_at: new Date().toISOString() })
-      }
-    );
-
-    const count = patchResp.headers.get('content-range') || '';
-    if (count === '*/0' || count === '') {
-      const checkResp = await fetch(
-        `${supabaseUrl}/rest/v1/user_sessions?open_id=eq.${encodeURIComponent(openId)}&select=id`,
-        { headers: getSupabaseHeaders(supabaseKey) }
-      );
-      const existing = await checkResp.json();
-      if (!existing || existing.length === 0) {
-        await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
-          method: 'POST',
-          headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
-          body: JSON.stringify({ open_id: openId, products, updated_at: new Date().toISOString() })
-        });
-      }
-    }
+    // 使用 Supabase UPSERT（POST + Prefer: resolution=merge-duplicates）
+    // open_id 存在 → UPDATE products + updated_at
+    // open_id 不存在 → INSERT 新记录
+    // 依赖 user_sessions.open_id 的 UNIQUE 约束（已在 Supabase 建立）
+    // 修复原因：旧的 PATCH → content-range 判断 → SELECT → INSERT 三步走逻辑
+    //   在 Supabase 返回 content-range 为 null 时判断失效，导致多用户 session 无法更新
+    await fetch(`${supabaseUrl}/rest/v1/user_sessions`, {
+      method: 'POST',
+      headers: {
+        ...getSupabaseHeaders(supabaseKey),
+        'Prefer': 'resolution=merge-duplicates,return=minimal'
+      },
+      body: JSON.stringify({
+        open_id: openId,
+        products,
+        updated_at: new Date().toISOString()
+      })
+    });
   } catch (e) {
-    // session 失败不影响主流程
+    // session 写入失败不影响主流程
   }
 }
 
@@ -453,7 +449,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.1.0'
+        version: '2.1.1'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 

@@ -1,11 +1,14 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.1.1
+ * Version: 2.1.2
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
  * Changelog:
  *   2.1.1 - 修复 setSession() 使用 UPSERT，解决多用户 session 丢失导致"查询已过期"的 Bug
+ *   2.1.2 - 修复 searchByModel() encodeURIComponent 将 * 编码为 %2A，导致 ilike 通配符失效
+ *           修复 mergeProducts() 改用 Map 替代普通 Object，避免纯数字 EAN key 被 V8 自动排序
+ *           以上两处修复确保搜索列表顺序与 session 存储顺序严格一致，数字选择不再返回错误产品
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
@@ -146,8 +149,11 @@ async function searchByEan(keyword, supabaseUrl, supabaseKey) {
 }
 
 async function searchByModel(keyword, supabaseUrl, supabaseKey) {
+  // 不能用 encodeURIComponent：它会把 ilike 通配符 * 编码成 %2A，导致模糊匹配失效
+  // 只去除 PostgREST 语法中的敏感字符（逗号、括号），空格由 fetch 自动处理为 %20
+  const safeKeyword = keyword.replace(/[,()]/g, '');
   const resp = await fetch(
-    `${supabaseUrl}/rest/v1/inventory?model=ilike.*${encodeURIComponent(keyword)}*&select=ean,model,warehouse,available_qty&limit=500`,
+    `${supabaseUrl}/rest/v1/inventory?model=ilike.*${safeKeyword}*&select=ean,model,warehouse,available_qty&limit=500`,
     { headers: getSupabaseHeaders(supabaseKey) }
   );
   const rows = await resp.json();
@@ -165,21 +171,25 @@ async function searchByModel(keyword, supabaseUrl, supabaseKey) {
 }
 
 function mergeProducts(rows) {
-  const products = {};
+  // 使用 Map 而非普通 Object：普通 Object 对纯数字 key（EAN）会被 V8 引擎按数值自动排序
+  // 导致合并后产品顺序被打乱，与搜索结果列表顺序不一致，数字选择时返回错误产品
+  // Map 严格保持 key 插入顺序，确保列表编号与 session 存储的产品一一对应
+  const productsMap = new Map();
   for (const row of rows) {
     const ean = String(row.ean || '').trim();
     if (!ean) continue;
-    if (!products[ean]) {
-      products[ean] = { ean, model: row.model || '', dubai_qty: null, saudi_qty: null };
+    if (!productsMap.has(ean)) {
+      productsMap.set(ean, { ean, model: row.model || '', dubai_qty: null, saudi_qty: null });
     }
+    const entry = productsMap.get(ean);
     const qty = row.available_qty ?? 0;
     if (row.warehouse && row.warehouse.includes('Dubai')) {
-      products[ean].dubai_qty = qty;
+      entry.dubai_qty = qty;
     } else if (row.warehouse && row.warehouse.includes('Saudi')) {
-      products[ean].saudi_qty = qty;
+      entry.saudi_qty = qty;
     }
   }
-  return Object.values(products);
+  return Array.from(productsMap.values());
 }
 
 // ============================================================
@@ -449,7 +459,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.1.1'
+        version: '2.1.2'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 

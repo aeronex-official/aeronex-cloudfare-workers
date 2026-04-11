@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.1.3
+ * Version: 2.2.0
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -10,6 +10,9 @@
  *           修复 mergeProducts() 改用 Map 替代普通 Object，避免纯数字 EAN key 被 V8 自动排序
  *   2.1.3 - 修复 setSession() UPSERT 未指定 on_conflict=open_id，导致冲突时以主键判断
  *           旧记录永远无法更新，session 停留在首次写入值，改为 DELETE + INSERT 彻底解决
+ *   2.2.0 - 新增 Lark 一键导出库存功能：发送「导出/export」触发，自动生成 UTF-8 BOM CSV
+ *           上传至 Lark Drive 后以文件消息发送；上传失败时降级为文字摘要+管理后台链接
+ *           支持中英文双语触发词（导出/导出库存/export/export inventory 等8个关键词）
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
@@ -202,6 +205,178 @@ function mergeProducts(rows) {
 }
 
 // ============================================================
+// 导出功能
+// ============================================================
+
+/**
+ * 检测用户输入是否为导出指令
+ * 支持中英文双语触发词
+ */
+function isExportCommand(keyword) {
+  const kw = keyword.trim().toLowerCase();
+  const triggers = [
+    '导出', '导出库存', '导出清单', '导出报表',
+    'export', 'export list', 'export inventory', 'export report'
+  ];
+  return triggers.includes(kw);
+}
+
+/**
+ * 分页拉取 Supabase inventory 表全量数据
+ * 每页 1000 条，直到返回行数 < pageSize 为止
+ */
+async function fetchAllInventory(supabaseUrl, supabaseKey) {
+  const allRows = [];
+  let offset = 0;
+  const pageSize = 1000;
+  while (true) {
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?select=ean,model,warehouse,available_qty&order=model.asc&limit=${pageSize}&offset=${offset}`,
+      { headers: getSupabaseHeaders(supabaseKey) }
+    );
+    const rows = await resp.json();
+    if (!Array.isArray(rows) || rows.length === 0) break;
+    allRows.push(...rows);
+    if (rows.length < pageSize) break;
+    offset += pageSize;
+  }
+  return allRows;
+}
+
+/**
+ * 将库存原始数据（迪拜/沙特各一行）按 EAN 合并，生成 UTF-8 BOM CSV 字符串
+ * BOM（\uFEFF）确保 Excel 直接打开时中文不乱码
+ * 表头：EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,合计/Total,同步时间/Sync Time
+ */
+function buildCsvContent(rows) {
+  const map = new Map();
+  for (const row of rows) {
+    const ean = String(row.ean || '').trim();
+    if (!ean) continue;
+    if (!map.has(ean)) {
+      map.set(ean, { ean, model: row.model || '', dubai: null, saudi: null });
+    }
+    const entry = map.get(ean);
+    const qty = row.available_qty ?? 0;
+    if (row.warehouse && row.warehouse.includes('Dubai')) entry.dubai = qty;
+    else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi = qty;
+  }
+
+  const syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  const BOM = '\uFEFF'; // UTF-8 BOM，让 Excel 直接打开中文不乱码
+  const header = 'EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,合计/Total,同步时间/Sync Time';
+
+  const dataLines = Array.from(map.values()).map(p => {
+    const dubai = p.dubai ?? 0;
+    const saudi = p.saudi ?? 0;
+    const total = dubai + saudi;
+    // 型号中若含逗号需加引号，避免 CSV 解析错误
+    const model = p.model.includes(',') ? `"${p.model}"` : p.model;
+    return `${p.ean},${model},${dubai},${saudi},${total},${syncTime}`;
+  });
+
+  return BOM + header + '\n' + dataLines.join('\n');
+}
+
+/**
+ * 将 CSV 字符串上传至 Lark Drive
+ * 使用 multipart/form-data 调用 /open-apis/drive/v1/files/upload_all
+ * 成功返回 file_token（后续发送文件消息使用），失败返回 null
+ * 前提：Lark 应用需已开通 drive:file 权限
+ */
+async function uploadFileToLark(csvContent, filename, token) {
+  const encoder = new TextEncoder();
+  const csvBytes = encoder.encode(csvContent);
+  const blob = new Blob([csvBytes], { type: 'text/csv' });
+
+  const formData = new FormData();
+  formData.append('file_name', filename);
+  formData.append('parent_type', 'explorer'); // 上传到用户云空间根目录
+  formData.append('size', String(csvBytes.length));
+  formData.append('file', blob, filename);
+
+  const resp = await fetch(
+    `${LARK_BASE_URL}/open-apis/drive/v1/files/upload_all`,
+    {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` },
+      // 注意：不设置 Content-Type，让 fetch 自动设置 multipart boundary
+      body: formData
+    }
+  );
+  const data = await resp.json();
+  return data?.data?.file_token || null;
+}
+
+/**
+ * 发送文件消息（Lark file 类型消息）
+ * 私聊发送给 open_id，群聊发送到 chat_id
+ */
+async function sendFileMessage(openId, fileToken, token, isGroup, chatId) {
+  const url = `${LARK_BASE_URL}/open-apis/im/v1/messages`;
+  const receiveIdType = (isGroup && chatId) ? 'chat_id' : 'open_id';
+  const receiveId = (isGroup && chatId) ? chatId : openId;
+
+  await fetch(`${url}?receive_id_type=${receiveIdType}`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      receive_id: receiveId,
+      msg_type: 'file',
+      content: JSON.stringify({ file_key: fileToken })
+    })
+  });
+}
+
+/**
+ * 导出主流程编排：
+ * 1. 立即回复"生成中"提示
+ * 2. 拉取全量数据 → 生成 CSV → 上传 Lark Drive → 发送文件消息
+ * 3. 上传失败时降级为文字摘要 + 管理后台链接
+ */
+async function handleExport(openId, token, isGroup, chatId, supabaseUrl, supabaseKey) {
+  // 先回复"生成中"提示，避免用户等待无响应
+  await sendReply(openId, '⏳ 正在生成库存报表，请稍候...', token, isGroup, chatId);
+
+  try {
+    // Step 1：拉取全量库存数据
+    const rows = await fetchAllInventory(supabaseUrl, supabaseKey);
+
+    // Step 2：生成 CSV 内容
+    const csvContent = buildCsvContent(rows);
+    const date = new Date().toISOString().slice(0, 10);
+    const filename = `AERONEX_Inventory_${date}.csv`;
+
+    // Step 3：上传至 Lark Drive，获取 file_token
+    const fileToken = await uploadFileToLark(csvContent, filename, token);
+
+    // 计算 SKU 数量（行数 - 1 表头）
+    const skuCount = (csvContent.match(/\n/g) || []).length - 1;
+    const syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+
+    if (fileToken) {
+      // Step 4a：上传成功，先发文字摘要，再发文件
+      await sendReply(
+        openId,
+        `✅ 库存报表已生成\n📦 共 ${skuCount} 个 SKU\n🗓 数据时间：${syncTime}`,
+        token, isGroup, chatId
+      );
+      await sendFileMessage(openId, fileToken, token, isGroup, chatId);
+    } else {
+      // Step 4b：上传失败，降级为文字摘要
+      throw new Error('file_token is null');
+    }
+  } catch (e) {
+    // 兜底：任何异常均回复管理后台链接
+    await sendReply(
+      openId,
+      `⚠️ 报表生成失败，请访问管理后台手动导出：\nhttps://tools-inventory-search.aeronex.ae/admin.html`,
+      token, isGroup, chatId
+    );
+  }
+}
+
+// ============================================================
 // 消息格式化
 // ============================================================
 
@@ -241,6 +416,11 @@ function formatSearchList(keyword, products) {
 async function handleMessage(openId, keyword, supabaseUrl, supabaseKey) {
   keyword = keyword.trim();
   if (!keyword) return null;
+
+  // ── 导出指令（优先级最高，在 EAN/数字选择/型号搜索之前判断）──
+  if (isExportCommand(keyword)) {
+    return '__EXPORT__'; // 特殊标记，由主入口调用 handleExport() 处理
+  }
 
   if (/^\d{1,2}$/.test(keyword)) {
     const num = parseInt(keyword);
@@ -468,7 +648,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.1.3'
+        version: '2.2.0'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 
@@ -535,7 +715,10 @@ export default {
     try {
       const token = await getLarkToken(larkAppId, larkAppSecret);
       const reply = await handleMessage(openId, keyword, supabaseUrl, supabaseKey);
-      if (reply) {
+      if (reply === '__EXPORT__') {
+        // 导出是异步长操作，独立调用，不阻塞其他消息处理
+        await handleExport(openId, token, isGroup, chatId, supabaseUrl, supabaseKey);
+      } else if (reply) {
         await sendReply(openId, reply, token, isGroup, chatId);
       }
     } catch (e) {

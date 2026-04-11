@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.2.0
+ * Version: 2.2.1
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -13,6 +13,9 @@
  *   2.2.0 - 新增 Lark 一键导出库存功能：发送「导出/export」触发，自动生成 UTF-8 BOM CSV
  *           上传至 Lark Drive 后以文件消息发送；上传失败时降级为文字摘要+管理后台链接
  *           支持中英文双语触发词（导出/导出库存/export/export inventory 等8个关键词）
+ *   2.2.1 - 修复导出文件无法在聊天窗口显示的问题：将上传 API 由 Drive API（返回 file_token）
+ *           改为 IM Files API（/open-apis/im/v1/files，返回 file_key）
+ *           Drive file_token 与 IM file_key 是不同凭证，只有 file_key 才能用于 IM 文件消息
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
@@ -279,10 +282,14 @@ function buildCsvContent(rows) {
 }
 
 /**
- * 将 CSV 字符串上传至 Lark Drive
- * 使用 multipart/form-data 调用 /open-apis/drive/v1/files/upload_all
- * 成功返回 file_token（后续发送文件消息使用），失败返回 null
- * 前提：Lark 应用需已开通 drive:file 权限
+ * 将 CSV 字符串上传至 Lark IM Files API
+ * 使用 multipart/form-data 调用 /open-apis/im/v1/files
+ * 成功返回 file_key（IM 消息专用凭证），失败返回 null
+ *
+ * ⚠️ 注意区分两个不同 API：
+ *   - Drive API（drive/v1/files/upload_all）→ 返回 file_token（云文档凭证，不能用于 IM 消息）
+ *   - IM Files API（im/v1/files）→ 返回 file_key（IM 消息专用，sendFileMessage 需要此值）
+ * 必须使用 IM Files API 才能在聊天窗口中直接发送可下载的文件消息
  */
 async function uploadFileToLark(csvContent, filename, token) {
   const encoder = new TextEncoder();
@@ -290,22 +297,22 @@ async function uploadFileToLark(csvContent, filename, token) {
   const blob = new Blob([csvBytes], { type: 'text/csv' });
 
   const formData = new FormData();
-  formData.append('file_name', filename);
-  formData.append('parent_type', 'explorer'); // 上传到用户云空间根目录
-  formData.append('size', String(csvBytes.length));
+  formData.append('file_type', 'csv');    // IM 文件类型，对应 CSV 格式
+  formData.append('file_name', filename); // 文件名（含 .csv 后缀）
   formData.append('file', blob, filename);
 
   const resp = await fetch(
-    `${LARK_BASE_URL}/open-apis/drive/v1/files/upload_all`,
+    `${LARK_BASE_URL}/open-apis/im/v1/files`, // ← IM Files API，返回 file_key
     {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` },
-      // 注意：不设置 Content-Type，让 fetch 自动设置 multipart boundary
+      // 不手动设置 Content-Type，让 fetch 自动设置正确的 multipart boundary
       body: formData
     }
   );
   const data = await resp.json();
-  return data?.data?.file_token || null;
+  // 返回 file_key，后续 sendFileMessage 中以 { file_key: "..." } 格式发送
+  return data?.data?.file_key || null;
 }
 
 /**
@@ -648,7 +655,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.2.0'
+        version: '2.2.1'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 

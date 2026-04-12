@@ -16,9 +16,13 @@
  *   2.2.1 - 修复导出文件无法在聊天窗口显示的问题：将上传 API 由 Drive API（返回 file_token）
  *           改为 IM Files API（/open-apis/im/v1/files，返回 file_key）
  *           Drive file_token 与 IM file_key 是不同凭证，只有 file_key 才能用于 IM 文件消息
+ *   2.2.2 - 修复 handleExport 异常被静默吞掉无法排查根因的问题
+ *           改为分步执行并将真实错误信息回复给用户（含步骤名+错误描述）
+ *           方便在 Lark 聊天窗口直接看到失败原因，无需查看 Worker 日志
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
+const VERSION = '2.2.2';
 
 // ============================================================
 // CORS 工具
@@ -342,44 +346,81 @@ async function sendFileMessage(openId, fileToken, token, isGroup, chatId) {
  * 3. 上传失败时降级为文字摘要 + 管理后台链接
  */
 async function handleExport(openId, token, isGroup, chatId, supabaseUrl, supabaseKey) {
-  // 先回复"生成中"提示，避免用户等待无响应
   await sendReply(openId, '⏳ 正在生成库存报表，请稍候...', token, isGroup, chatId);
 
+  // ── Step 1：拉取全量库存数据 ──
+  let rows;
   try {
-    // Step 1：拉取全量库存数据
-    const rows = await fetchAllInventory(supabaseUrl, supabaseKey);
-
-    // Step 2：生成 CSV 内容
-    const csvContent = buildCsvContent(rows);
-    const date = new Date().toISOString().slice(0, 10);
-    const filename = `AERONEX_Inventory_${date}.csv`;
-
-    // Step 3：上传至 Lark Drive，获取 file_token
-    const fileToken = await uploadFileToLark(csvContent, filename, token);
-
-    // 计算 SKU 数量（行数 - 1 表头）
-    const skuCount = (csvContent.match(/\n/g) || []).length - 1;
-    const syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
-
-    if (fileToken) {
-      // Step 4a：上传成功，先发文字摘要，再发文件
-      await sendReply(
-        openId,
-        `✅ 库存报表已生成\n📦 共 ${skuCount} 个 SKU\n🗓 数据时间：${syncTime}`,
-        token, isGroup, chatId
-      );
-      await sendFileMessage(openId, fileToken, token, isGroup, chatId);
-    } else {
-      // Step 4b：上传失败，降级为文字摘要
-      throw new Error('file_token is null');
-    }
+    rows = await fetchAllInventory(supabaseUrl, supabaseKey);
   } catch (e) {
-    // 兜底：任何异常均回复管理后台链接
+    await sendReply(openId, `❌ [Step1] 读取数据库失败：${e.message}`, token, isGroup, chatId);
+    return;
+  }
+  if (!rows || rows.length === 0) {
+    await sendReply(openId, '❌ [Step1] 数据库返回空数据，请检查 Supabase inventory 表是否有数据', token, isGroup, chatId);
+    return;
+  }
+
+  // ── Step 2：生成 CSV 内容 ──
+  let csvContent, filename, skuCount, syncTime;
+  try {
+    csvContent = buildCsvContent(rows);
+    const date = new Date().toISOString().slice(0, 10);
+    filename = `AERONEX_Inventory_${date}.csv`;
+    skuCount = (csvContent.match(/\n/g) || []).length - 1;
+    syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  } catch (e) {
+    await sendReply(openId, `❌ [Step2] CSV 生成失败：${e.message}`, token, isGroup, chatId);
+    return;
+  }
+
+  // ── Step 3：上传至 Lark IM Files API，获取 file_key ──
+  let fileKey;
+  try {
+    fileKey = await uploadFileToLark(csvContent, filename, token);
+  } catch (e) {
+    await sendReply(openId,
+      `❌ [Step3] 文件上传请求异常：${e.message}\n请检查 Lark 应用是否已开启 im:file:write 权限`,
+      token, isGroup, chatId);
+    return;
+  }
+
+  if (!fileKey) {
+    // file_key 为空时，重新调用一次拿到具体错误码
+    let errDetail = '未知错误';
+    try {
+      const encoder = new TextEncoder();
+      const blob = new Blob([encoder.encode(csvContent)], { type: 'text/csv' });
+      const fd = new FormData();
+      fd.append('file_type', 'csv');
+      fd.append('file_name', filename);
+      fd.append('file', blob, filename);
+      const r = await fetch(`${LARK_BASE_URL}/open-apis/im/v1/files`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: fd
+      });
+      const d = await r.json();
+      errDetail = `Lark code=${d.code}，msg=${d.msg}`;
+    } catch (e2) {
+      errDetail = e2.message;
+    }
+    await sendReply(openId,
+      `❌ [Step3] 文件上传失败：${errDetail}\n\n🔧 常见原因：\n1. Lark 应用未开启 im:file:write 权限\n2. tenant_access_token 获取失败\n\n可访问管理后台手动导出：\nhttps://tools-inventory-search.aeronex.ae/admin.html`,
+      token, isGroup, chatId);
+    return;
+  }
+
+  // ── Step 4：发送文字摘要 + 文件消息 ──
+  try {
     await sendReply(
       openId,
-      `⚠️ 报表生成失败，请访问管理后台手动导出：\nhttps://tools-inventory-search.aeronex.ae/admin.html`,
+      `✅ 库存报表已生成\n📦 共 ${skuCount} 个 SKU\n🗓 数据时间：${syncTime}`,
       token, isGroup, chatId
     );
+    await sendFileMessage(openId, fileKey, token, isGroup, chatId);
+  } catch (e) {
+    await sendReply(openId, `❌ [Step4] 发送文件消息失败：${e.message}`, token, isGroup, chatId);
   }
 }
 
@@ -655,7 +696,7 @@ export default {
     if (request.method === 'GET') {
       return new Response(JSON.stringify({
         status: 'AERONEX Lark Bot is running',
-        version: '2.2.1'
+        version: VERSION
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 

@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.2.1
+ * Version: 2.2.3
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -19,10 +19,12 @@
  *   2.2.2 - 修复 handleExport 异常被静默吞掉无法排查根因的问题
  *           改为分步执行并将真实错误信息回复给用户（含步骤名+错误描述）
  *           方便在 Lark 聊天窗口直接看到失败原因，无需查看 Worker 日志
+ *   2.2.3 - 修复 uploadFileToLark file_type 传了 'csv' 导致 code=234001 Invalid request param
+ *           Lark im/v1/files 只支持固定枚举值，CSV 文件必须用 'stream'（通用二进制流）
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.2.2';
+const VERSION = '2.2.3';
 
 // ============================================================
 // CORS 工具
@@ -298,11 +300,13 @@ function buildCsvContent(rows) {
 async function uploadFileToLark(csvContent, filename, token) {
   const encoder = new TextEncoder();
   const csvBytes = encoder.encode(csvContent);
-  const blob = new Blob([csvBytes], { type: 'text/csv' });
+  const blob = new Blob([csvBytes], { type: 'application/octet-stream' });
 
   const formData = new FormData();
-  formData.append('file_type', 'csv');    // IM 文件类型，对应 CSV 格式
-  formData.append('file_name', filename); // 文件名（含 .csv 后缀）
+  // ⚠️ Lark im/v1/files 的 file_type 只接受固定枚举：opus/mp4/pdf/doc/xls/ppt/stream
+  // CSV 不在枚举内，必须用 'stream'（通用二进制流），否则返回 code=234001
+  formData.append('file_type', 'stream');
+  formData.append('file_name', filename); // 文件名（含 .csv 后缀），Lark 会保留原始扩展名
   formData.append('file', blob, filename);
 
   const resp = await fetch(
@@ -390,9 +394,9 @@ async function handleExport(openId, token, isGroup, chatId, supabaseUrl, supabas
     let errDetail = '未知错误';
     try {
       const encoder = new TextEncoder();
-      const blob = new Blob([encoder.encode(csvContent)], { type: 'text/csv' });
+      const blob = new Blob([encoder.encode(csvContent)], { type: 'application/octet-stream' });
       const fd = new FormData();
-      fd.append('file_type', 'csv');
+      fd.append('file_type', 'stream');
       fd.append('file_name', filename);
       fd.append('file', blob, filename);
       const r = await fetch(`${LARK_BASE_URL}/open-apis/im/v1/files`, {

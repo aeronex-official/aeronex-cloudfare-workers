@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.2.3
+ * Version: 2.2.4
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -21,10 +21,18 @@
  *           方便在 Lark 聊天窗口直接看到失败原因，无需查看 Worker 日志
  *   2.2.3 - 修复 uploadFileToLark file_type 传了 'csv' 导致 code=234001 Invalid request param
  *           Lark im/v1/files 只支持固定枚举值，CSV 文件必须用 'stream'（通用二进制流）
+ *   2.2.4 - 时间显示改为迪拜时间（UTC+4 / GST），格式：YYYY-MM-DD HH:mm GST
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.2.3';
+const VERSION = '2.2.4';
+
+// 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
+function toDubaiTime(date) {
+  const offset = 4 * 60; // UTC+4，单位分钟
+  const local = new Date(date.getTime() + offset * 60 * 1000);
+  return local.toISOString().replace('T', ' ').slice(0, 16) + ' GST';
+}
 
 // ============================================================
 // CORS 工具
@@ -271,7 +279,7 @@ function buildCsvContent(rows) {
     else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi = qty;
   }
 
-  const syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+  const syncTime = toDubaiTime(new Date());
   const BOM = '\uFEFF'; // UTF-8 BOM，让 Excel 直接打开中文不乱码
   const header = 'EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,合计/Total,同步时间/Sync Time';
 
@@ -372,7 +380,7 @@ async function handleExport(openId, token, isGroup, chatId, supabaseUrl, supabas
     const date = new Date().toISOString().slice(0, 10);
     filename = `AERONEX_Inventory_${date}.csv`;
     skuCount = (csvContent.match(/\n/g) || []).length - 1;
-    syncTime = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+    syncTime = toDubaiTime(new Date());
   } catch (e) {
     await sendReply(openId, `❌ [Step2] CSV 生成失败：${e.message}`, token, isGroup, chatId);
     return;

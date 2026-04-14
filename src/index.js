@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.2.4
+ * Version: 2.3.0
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -22,10 +22,13 @@
  *   2.2.3 - 修复 uploadFileToLark file_type 传了 'csv' 导致 code=234001 Invalid request param
  *           Lark im/v1/files 只支持固定枚举值，CSV 文件必须用 'stream'（通用二进制流）
  *   2.2.4 - 时间显示改为迪拜时间（UTC+4 / GST），格式：YYYY-MM-DD HH:mm GST
+ *   2.3.0 - 新增金蝶 B2B 只读 API（/api/inventory 单条查询、/api/inventory/batch 批量查询）
+ *           通过 X-API-Key 请求头验证身份，密钥存储于 Supabase api_keys 表
+ *           verifyApiKey() 验证合法性并自动更新 last_used_at，支持随时禁用密钥
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.2.4';
+const VERSION = '2.3.0';
 
 // 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
 function toDubaiTime(date) {
@@ -539,6 +542,209 @@ async function sendReply(openId, text, token, isGroup, chatId) {
 }
 
 // ============================================================
+// 金蝶 B2B 只读 API — API Key 验证
+// ============================================================
+
+/**
+ * 验证请求头中的 X-API-Key 是否合法
+ * - 查询 Supabase api_keys 表，status='active' 才通过
+ * - 验证通过后异步更新 last_used_at（不阻塞响应）
+ * 返回值：{ valid: true } 或 { valid: false, reason: '...' }
+ */
+async function verifyApiKey(apiKey, supabaseUrl, supabaseKey) {
+  if (!apiKey) return { valid: false, reason: 'Missing API Key' };
+
+  try {
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/api_keys?api_key=eq.${encodeURIComponent(apiKey)}&select=id,status,client_name`,
+      { headers: getSupabaseHeaders(supabaseKey) }
+    );
+    const rows = await resp.json();
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return { valid: false, reason: 'Invalid API Key' };
+    }
+
+    const record = rows[0];
+    if (record.status !== 'active') {
+      return { valid: false, reason: 'API Key disabled' };
+    }
+
+    // 异步更新 last_used_at，不阻塞当前响应
+    fetch(
+      `${supabaseUrl}/rest/v1/api_keys?id=eq.${record.id}`,
+      {
+        method: 'PATCH',
+        headers: { ...getSupabaseHeaders(supabaseKey), 'Prefer': 'return=minimal' },
+        body: JSON.stringify({ last_used_at: new Date().toISOString() })
+      }
+    ).catch(() => {});
+
+    return { valid: true, clientName: record.client_name };
+  } catch (e) {
+    return { valid: false, reason: 'API Key verification error' };
+  }
+}
+
+// ============================================================
+// 金蝶 B2B 只读 API — 路由处理
+// ============================================================
+
+/**
+ * 处理金蝶 B2B 库存查询请求
+ *
+ * 路由：
+ *   GET  /api/inventory?ean={EAN}      — 单条 EAN 查询
+ *   POST /api/inventory/batch          — 批量 EAN 查询（Body: { "eans": [...] }）
+ *
+ * 认证：请求头 X-API-Key，密钥存于 Supabase api_keys 表
+ */
+async function handleB2bRequest(request, url, env) {
+  const cors = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key'
+  };
+
+  // OPTIONS 预检
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: cors });
+  }
+
+  const supabaseUrl = env.SUPABASE_URL;
+  const supabaseKey = env.SUPABASE_SECRET_KEY;
+  const apiKey = request.headers.get('X-API-Key') || '';
+
+  // ── 验证 API Key ──
+  const auth = await verifyApiKey(apiKey, supabaseUrl, supabaseKey);
+  if (!auth.valid) {
+    const statusCode = auth.reason === 'API Key disabled' ? 403 : 401;
+    return jsonResponse({ code: statusCode, message: auth.reason }, statusCode, cors);
+  }
+
+  const pathname = url.pathname;
+  const method = request.method;
+
+  // ── GET /api/inventory?ean=... ── 单条 EAN 查询 ──
+  if (method === 'GET' && pathname === '/api/inventory') {
+    const ean = url.searchParams.get('ean') || '';
+    if (!ean) {
+      return jsonResponse({ code: 400, message: 'ean parameter is required' }, 400, cors);
+    }
+
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?ean=eq.${encodeURIComponent(ean)}&select=ean,model,warehouse,available_qty`,
+      { headers: getSupabaseHeaders(supabaseKey) }
+    );
+    const rows = await resp.json();
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return jsonResponse({ code: 404, message: 'EAN not found' }, 200, cors);
+    }
+
+    // 合并迪拜/沙特两条记录为一条响应
+    let dubaiQty = null, saudiQty = null, model = '';
+    for (const row of rows) {
+      model = model || row.model || '';
+      if (row.warehouse && row.warehouse.includes('Dubai')) dubaiQty = row.available_qty ?? 0;
+      else if (row.warehouse && row.warehouse.includes('Saudi')) saudiQty = row.available_qty ?? 0;
+    }
+
+    return jsonResponse({
+      code: 0,
+      data: {
+        ean,
+        model,
+        dubai_qty:  dubaiQty,
+        saudi_qty:  saudiQty,
+        total_qty:  (dubaiQty ?? 0) + (saudiQty ?? 0),
+        sync_time:  toDubaiTime(new Date())
+      }
+    }, 200, cors);
+  }
+
+  // ── POST /api/inventory/batch ── 批量 EAN 查询 ──
+  if (method === 'POST' && pathname === '/api/inventory/batch') {
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return jsonResponse({ code: 400, message: 'Invalid JSON body' }, 400, cors);
+    }
+
+    const eans = body.eans;
+    if (!Array.isArray(eans) || eans.length === 0) {
+      return jsonResponse(
+        { code: 400, message: 'eans is required and must be a non-empty array' },
+        400, cors
+      );
+    }
+
+    // 限制单次最多 50 条
+    if (eans.length > 50) {
+      return jsonResponse(
+        { code: 400, message: 'Maximum 50 EANs per request' },
+        400, cors
+      );
+    }
+
+    // 构造 Supabase in 过滤查询
+    const eanList = eans.map(e => encodeURIComponent(String(e).trim())).join(',');
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?ean=in.(${eanList})&select=ean,model,warehouse,available_qty`,
+      { headers: getSupabaseHeaders(supabaseKey) }
+    );
+    const rows = await resp.json();
+
+    // 按 EAN 合并迪拜/沙特数据
+    const map = new Map();
+    if (Array.isArray(rows)) {
+      for (const row of rows) {
+        const key = String(row.ean || '').trim();
+        if (!key) continue;
+        if (!map.has(key)) {
+          map.set(key, { ean: key, model: row.model || '', dubai_qty: null, saudi_qty: null });
+        }
+        const entry = map.get(key);
+        if (!entry.model && row.model) entry.model = row.model;
+        if (row.warehouse && row.warehouse.includes('Dubai')) entry.dubai_qty = row.available_qty ?? 0;
+        else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi_qty = row.available_qty ?? 0;
+      }
+    }
+
+    const syncTime = toDubaiTime(new Date());
+    const data = [];
+    const notFound = [];
+
+    for (const ean of eans) {
+      const key = String(ean).trim();
+      if (map.has(key)) {
+        const entry = map.get(key);
+        data.push({
+          ean:       entry.ean,
+          model:     entry.model,
+          dubai_qty: entry.dubai_qty,
+          saudi_qty: entry.saudi_qty,
+          total_qty: (entry.dubai_qty ?? 0) + (entry.saudi_qty ?? 0),
+          sync_time: syncTime
+        });
+      } else {
+        notFound.push(key);
+      }
+    }
+
+    return jsonResponse({
+      code:      0,
+      total:     data.length,
+      data,
+      not_found: notFound
+    }, 200, cors);
+  }
+
+  return jsonResponse({ code: 404, message: 'Not found' }, 404, cors);
+}
+
+// ============================================================
 // Admin API 路由处理
 // ============================================================
 
@@ -692,6 +898,11 @@ export default {
     // ── Admin API 路由（/api/admin/*）──
     if (pathname.startsWith('/api/admin/')) {
       return handleAdminRequest(request, url, env);
+    }
+
+    // ── 金蝶 B2B 只读 API 路由（/api/inventory 和 /api/inventory/batch）──
+    if (pathname === '/api/inventory' || pathname === '/api/inventory/batch') {
+      return handleB2bRequest(request, url, env);
     }
 
     // ── OPTIONS 预检（通用）──

@@ -1,6 +1,6 @@
 /**
  * AERONEX Lark Bot + Admin API - Cloudflare Worker
- * Version: 2.3.0
+ * Version: 2.4.0
  * 功能：
  *   - 接收 Lark 消息，查询 Supabase 库存数据
  *   - /api/admin/* 提供库存管理 REST API（需 X-Admin-Password 验证）
@@ -25,10 +25,15 @@
  *   2.3.0 - 新增金蝶 B2B 只读 API（/api/inventory 单条查询、/api/inventory/batch 批量查询）
  *           通过 X-API-Key 请求头验证身份，密钥存储于 Supabase api_keys 表
  *           verifyApiKey() 验证合法性并自动更新 last_used_at，支持随时禁用密钥
+ *   2.4.0 - 新增香港仓库（HK Inventory）支持：
+ *           - Lark 机器人查询回复新增 HK 库存行（formatProductDetail）
+ *           - CSV 导出新增「香港库存/HK」列，合计包含迪拜+沙特+香港三仓
+ *           - mergeProducts() 新增 hk_qty 字段
+ *           - B2B API 保持不变（仅迪拜+沙特）
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 
 // 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
 function toDubaiTime(date) {
@@ -211,7 +216,8 @@ function mergeProducts(rows) {
     const ean = String(row.ean || '').trim();
     if (!ean) continue;
     if (!productsMap.has(ean)) {
-      productsMap.set(ean, { ean, model: row.model || '', dubai_qty: null, saudi_qty: null });
+      // v2.4.0: 新增 hk_qty 字段，支持香港仓库库存
+      productsMap.set(ean, { ean, model: row.model || '', dubai_qty: null, saudi_qty: null, hk_qty: null });
     }
     const entry = productsMap.get(ean);
     const qty = row.available_qty ?? 0;
@@ -219,6 +225,9 @@ function mergeProducts(rows) {
       entry.dubai_qty = qty;
     } else if (row.warehouse && row.warehouse.includes('Saudi')) {
       entry.saudi_qty = qty;
+    } else if (row.warehouse && row.warehouse.includes('HK')) {
+      // v2.4.0: 香港仓库识别（warehouse = 'HK Inventory'）
+      entry.hk_qty = qty;
     }
   }
   return Array.from(productsMap.values());
@@ -264,9 +273,10 @@ async function fetchAllInventory(supabaseUrl, supabaseKey) {
 }
 
 /**
- * 将库存原始数据（迪拜/沙特各一行）按 EAN 合并，生成 UTF-8 BOM CSV 字符串
+ * 将库存原始数据（迪拜/沙特/香港各一行）按 EAN 合并，生成 UTF-8 BOM CSV 字符串
  * BOM（\uFEFF）确保 Excel 直接打开时中文不乱码
- * 表头：EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,合计/Total,同步时间/Sync Time
+ * v2.4.0 表头：EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,香港库存/HK,合计/Total,同步时间/Sync Time
+ * 合计 = 迪拜 + 沙特 + 香港（三仓合并）
  */
 function buildCsvContent(rows) {
   const map = new Map();
@@ -274,25 +284,29 @@ function buildCsvContent(rows) {
     const ean = String(row.ean || '').trim();
     if (!ean) continue;
     if (!map.has(ean)) {
-      map.set(ean, { ean, model: row.model || '', dubai: null, saudi: null });
+      // v2.4.0: 新增 hk 字段
+      map.set(ean, { ean, model: row.model || '', dubai: null, saudi: null, hk: null });
     }
     const entry = map.get(ean);
     const qty = row.available_qty ?? 0;
     if (row.warehouse && row.warehouse.includes('Dubai')) entry.dubai = qty;
     else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi = qty;
+    else if (row.warehouse && row.warehouse.includes('HK')) entry.hk = qty; // v2.4.0 香港
   }
 
   const syncTime = toDubaiTime(new Date());
   const BOM = '\uFEFF'; // UTF-8 BOM，让 Excel 直接打开中文不乱码
-  const header = 'EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,合计/Total,同步时间/Sync Time';
+  // v2.4.0: 表头新增「香港库存/HK」列
+  const header = 'EAN,产品型号/Model,迪拜库存/Dubai,沙特库存/Saudi,香港库存/HK,合计/Total,同步时间/Sync Time';
 
   const dataLines = Array.from(map.values()).map(p => {
     const dubai = p.dubai ?? 0;
     const saudi = p.saudi ?? 0;
-    const total = dubai + saudi;
+    const hk    = p.hk    ?? 0; // v2.4.0 香港，无记录则计为 0
+    const total = dubai + saudi + hk; // v2.4.0: 合计包含三仓
     // 型号中若含逗号需加引号，避免 CSV 解析错误
     const model = p.model.includes(',') ? `"${p.model}"` : p.model;
-    return `${p.ean},${model},${dubai},${saudi},${total},${syncTime}`;
+    return `${p.ean},${model},${dubai},${saudi},${hk},${total},${syncTime}`;
   });
 
   return BOM + header + '\n' + dataLines.join('\n');
@@ -451,12 +465,14 @@ function formatQty(qty) {
 }
 
 function formatProductDetail(p) {
+  // v2.4.0: 新增香港仓库库存行；hk_qty 为 null 时 formatQty 返回「—」（无记录）
   return [
     '━'.repeat(28),
     `📦 ${p.model}`,
     `EAN: ${p.ean}`,
     `🇦🇪 Dubai:  ${formatQty(p.dubai_qty)}`,
     `🇸🇦 Saudi:  ${formatQty(p.saudi_qty)}`,
+    `🇭🇰 HK:     ${formatQty(p.hk_qty)}`,
     '━'.repeat(28)
   ].join('\n');
 }

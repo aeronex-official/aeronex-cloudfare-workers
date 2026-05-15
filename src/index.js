@@ -221,12 +221,14 @@ function mergeProducts(rows) {
     }
     const entry = productsMap.get(ean);
     const qty = row.available_qty ?? 0;
-    if (row.warehouse && row.warehouse.includes('Dubai')) {
+    // v3.0: warehouse 值已统一为小写 'dubai' / 'saudi' / 'hk'
+    // 同时兼容旧格式 'Dubai Inventory' / 'Saudi Inventory' / 'HK Inventory'
+    const wh = (row.warehouse || '').toLowerCase();
+    if (wh.includes('dubai')) {
       entry.dubai_qty = qty;
-    } else if (row.warehouse && row.warehouse.includes('Saudi')) {
+    } else if (wh.includes('saudi')) {
       entry.saudi_qty = qty;
-    } else if (row.warehouse && row.warehouse.includes('HK')) {
-      // v2.4.0: 香港仓库识别（warehouse = 'HK Inventory'）
+    } else if (wh === 'hk' || wh.includes('hk')) {
       entry.hk_qty = qty;
     }
   }

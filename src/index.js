@@ -25,6 +25,18 @@
  *   2.3.0 - 新增金蝶 B2B 只读 API（/api/inventory 单条查询、/api/inventory/batch 批量查询）
  *           通过 X-API-Key 请求头验证身份，密钥存储于 Supabase api_keys 表
  *           verifyApiKey() 验证合法性并自动更新 last_used_at，支持随时禁用密钥
+ *   2.5.0 - 新增在途库存（Inbound）查询支持：
+ *           - fetchInboundByEan() 按 EAN 查询 inbound 表，返回各仓在途记录
+ *           - formatProductDetail() 升级：附加在途数量 + ETA（🚢图标）
+ *           - 同一仓库多条在途记录按 ETA 升序全部展示（以 · 分隔）
+ *           - 英文回复：Dubai / Saudi / HK / On-hand Total / In-transit
+ *           - 合计行仅计现货，在途独立展示（On-hand Total vs In-transit）
+ *           - 新增 /api/admin/inbound 接口（返回全量在途记录，供将来扩展）
+ *   2.4.1 - 修复 CSV 导出库存全为 0 的 Bug：
+ *           buildCsvContent() 的 warehouse 匹配改为 toLowerCase() 规范化后再比较
+ *           根因：sync v3.0 写入 Supabase 的 warehouse 值为小写（'dubai'/'saudi'/'hk'）
+ *           而旧代码用 includes('Dubai') 大写匹配，三仓全部失败导致数量归零
+ *           对齐 mergeProducts() 已有的 toLowerCase() 逻辑，两处保持一致
  *   2.4.0 - 新增香港仓库（HK Inventory）支持：
  *           - Lark 机器人查询回复新增 HK 库存行（formatProductDetail）
  *           - CSV 导出新增「香港库存/HK」列，合计包含迪拜+沙特+香港三仓
@@ -33,7 +45,7 @@
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.4.0';
+const VERSION = '2.5.0';
 
 // 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
 function toDubaiTime(date) {
@@ -185,6 +197,22 @@ async function searchByEan(keyword, supabaseUrl, supabaseKey) {
   return mergeProducts(rows);
 }
 
+/**
+ * Fetch all in-transit (inbound) records for a given EAN.
+ * Returns an array of { warehouse, inbound_qty, eta } objects.
+ * Multiple records per warehouse are possible (different ETAs).
+ */
+async function fetchInboundByEan(ean, supabaseUrl, supabaseKey) {
+  const resp = await fetch(
+    `${supabaseUrl}/rest/v1/inbound?ean=eq.${encodeURIComponent(ean)}&select=warehouse,inbound_qty,eta&order=eta.asc.nullslast`,
+    { headers: getSupabaseHeaders(supabaseKey) }
+  );
+  if (!resp.ok) return [];
+  const rows = await resp.json();
+  if (!Array.isArray(rows)) return [];
+  return rows;
+}
+
 async function searchByModel(keyword, supabaseUrl, supabaseKey) {
   // 不能用 encodeURIComponent：它会把 ilike 通配符 * 编码成 %2A，导致模糊匹配失效
   // 只去除 PostgREST 语法中的敏感字符（逗号、括号），空格由 fetch 自动处理为 %20
@@ -291,9 +319,13 @@ function buildCsvContent(rows) {
     }
     const entry = map.get(ean);
     const qty = row.available_qty ?? 0;
-    if (row.warehouse && row.warehouse.includes('Dubai')) entry.dubai = qty;
-    else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi = qty;
-    else if (row.warehouse && row.warehouse.includes('HK')) entry.hk = qty; // v2.4.0 香港
+    // v2.4.1: 统一 toLowerCase() 规范化后再匹配
+    // 修复 sync v3.0 写入 Supabase 的 warehouse 值为小写（'dubai'/'saudi'/'hk'）
+    // 导致大写 includes('Dubai') 全部匹配失败，CSV 导出库存全为 0 的 Bug
+    const wh = (row.warehouse || '').toLowerCase();
+    if (wh.includes('dubai')) entry.dubai = qty;
+    else if (wh.includes('saudi')) entry.saudi = qty;
+    else if (wh.includes('hk')) entry.hk = qty;
   }
 
   const syncTime = toDubaiTime(new Date());
@@ -461,22 +493,93 @@ async function handleExport(openId, token, isGroup, chatId, supabaseUrl, supabas
 
 function formatQty(qty) {
   if (qty === null || qty === undefined) return '—';
-  if (qty > 0) return `✅ ${qty} 件`;
-  if (qty < 0) return `⚠️ ${qty} 件`;
-  return '❌ 无库存';
+  if (qty > 0) return String(qty);
+  if (qty < 0) return `⚠️ ${qty}`;
+  return '0';
 }
 
-function formatProductDetail(p) {
-  // v2.4.0: 新增香港仓库库存行；hk_qty 为 null 时 formatQty 返回「—」（无记录）
-  return [
-    '━'.repeat(28),
+/**
+ * Format ETA date string for display.
+ * Input: 'YYYY-MM-DD' or null
+ * Output: 'Jun-15' style, or 'No ETA'
+ */
+function formatEta(etaStr) {
+  if (!etaStr) return 'No ETA';
+  try {
+    const d = new Date(etaStr + 'T00:00:00Z');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${months[d.getUTCMonth()]}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  } catch (e) {
+    return etaStr;
+  }
+}
+
+/**
+ * Format inbound entries for a specific warehouse into a compact string.
+ * e.g. "🚢 +20 (ETA Jun-15) · +8 (ETA Jun-28)"
+ * Multiple records sorted by ETA asc (nulls last) — handled by Supabase query.
+ */
+function formatInboundLine(inboundRows, warehouse) {
+  const wh = warehouse.toLowerCase();
+  const entries = inboundRows.filter(r => (r.warehouse || '').toLowerCase() === wh);
+  if (!entries.length) return '';
+  const parts = entries.map(r => {
+    const eta = formatEta(r.eta);
+    return `+${r.inbound_qty} (ETA ${eta})`;
+  });
+  return `  🚢 ${parts.join(' · ')}`;
+}
+
+/**
+ * v2.5.0: formatProductDetail now accepts optional inboundRows array.
+ * Shows on-hand stock per warehouse, appends in-transit info if present.
+ * All text is in English. Total = on-hand only (no in-transit).
+ */
+function formatProductDetail(p, inboundRows) {
+  const dubaiQty  = p.dubai_qty  ?? 0;
+  const saudiQty  = p.saudi_qty  ?? 0;
+  const hkQty     = p.hk_qty     ?? 0;
+  const onHandTotal = dubaiQty + saudiQty + hkQty;
+
+  // Per-warehouse inbound lines (empty string if no inbound for that warehouse)
+  const dubaiInbound = inboundRows ? formatInboundLine(inboundRows, 'dubai') : '';
+  const saudiInbound = inboundRows ? formatInboundLine(inboundRows, 'saudi') : '';
+  const hkInbound    = inboundRows ? formatInboundLine(inboundRows, 'hk')    : '';
+
+  // Build inbound summary line (only shown if any warehouse has inbound)
+  let inboundSummary = '';
+  if (inboundRows && inboundRows.length > 0) {
+    const totalInbound = inboundRows.reduce((sum, r) => sum + (r.inbound_qty || 0), 0);
+    // Build breakdown: "Dubai +28 · Saudi +5"
+    const breakdown = [];
+    const dubaiTotal = inboundRows
+      .filter(r => r.warehouse === 'dubai')
+      .reduce((s, r) => s + r.inbound_qty, 0);
+    const saudiTotal = inboundRows
+      .filter(r => r.warehouse === 'saudi')
+      .reduce((s, r) => s + r.inbound_qty, 0);
+    const hkTotal = inboundRows
+      .filter(r => r.warehouse === 'hk')
+      .reduce((s, r) => s + r.inbound_qty, 0);
+    if (dubaiTotal > 0) breakdown.push(`Dubai +${dubaiTotal}`);
+    if (saudiTotal > 0) breakdown.push(`Saudi +${saudiTotal}`);
+    if (hkTotal   > 0) breakdown.push(`HK +${hkTotal}`);
+    const breakdownStr = breakdown.length > 1 ? ` (${breakdown.join(' · ')})` : '';
+    inboundSummary = `\n🚢 In-transit: ${totalInbound}${breakdownStr}`;
+  }
+
+  const lines = [
+    '━'.repeat(30),
     `📦 ${p.model}`,
     `EAN: ${p.ean}`,
-    `🇦🇪 Dubai:  ${formatQty(p.dubai_qty)}`,
-    `🇸🇦 Saudi:  ${formatQty(p.saudi_qty)}`,
-    `🇭🇰 HK:     ${formatQty(p.hk_qty)}`,
-    '━'.repeat(28)
-  ].join('\n');
+    `🇦🇪 Dubai:  ${formatQty(dubaiQty)}${dubaiInbound}`,
+    `🇸🇦 Saudi:  ${formatQty(saudiQty)}${saudiInbound}`,
+    `🇭🇰 HK:     ${formatQty(hkQty)}${hkInbound}`,
+    '─'.repeat(30),
+    `On-hand Total: ${onHandTotal}${inboundSummary}`,
+    '━'.repeat(30),
+  ];
+  return lines.join('\n');
 }
 
 function formatSearchList(keyword, products) {
@@ -508,30 +611,34 @@ async function handleMessage(openId, keyword, supabaseUrl, supabaseKey) {
     const session = await getSession(openId, supabaseUrl, supabaseKey);
     if (session && session.length > 0) {
       if (num >= 1 && num <= session.length) {
-        return formatProductDetail(session[num - 1]);
+        const product = session[num - 1];
+        const inboundRows = await fetchInboundByEan(product.ean, supabaseUrl, supabaseKey);
+        return formatProductDetail(product, inboundRows);
       }
-      return `⚠️ 请输入 1-${session.length} 之间的数字`;
+      return `⚠️ Please enter a number between 1 and ${session.length}`;
     }
-    return '⚠️ 查询已过期，请重新输入产品名称或EAN码';
+    return '⚠️ Session expired, please search again by product name or EAN';
   }
 
   if (isEan(keyword)) {
     const products = await searchByEan(keyword, supabaseUrl, supabaseKey);
     if (!products.length) {
-      return `❌ 未找到 EAN「${keyword}」\n\n请确认EAN码是否正确，或尝试输入型号关键词`;
+      return `❌ EAN "${keyword}" not found\n\nPlease check the EAN or try searching by model name`;
     }
+    const inboundRows = await fetchInboundByEan(keyword, supabaseUrl, supabaseKey);
     await setSession(openId, products, supabaseUrl, supabaseKey);
-    return formatProductDetail(products[0]);
+    return formatProductDetail(products[0], inboundRows);
   }
 
   const products = await searchByModel(keyword, supabaseUrl, supabaseKey);
   if (!products.length) {
-    return `❌ 未找到与「${keyword}」相关的产品\n\n请尝试：\n• 输入完整 EAN 码（如：6937224106420）\n• 输入型号关键词（如：Zenmuse X7、Matrice 400）`;
+    return `❌ No products found for "${keyword}"\n\nTry:\n• Full EAN barcode (e.g. 6937224106420)\n• Model keyword (e.g. Zenmuse X7, Matrice 400)`;
   }
 
   if (products.length === 1) {
+    const inboundRows = await fetchInboundByEan(products[0].ean, supabaseUrl, supabaseKey);
     await setSession(openId, products, supabaseUrl, supabaseKey);
-    return formatProductDetail(products[0]);
+    return formatProductDetail(products[0], inboundRows);
   }
 
   await setSession(openId, products.slice(0, 10), supabaseUrl, supabaseKey);
@@ -898,6 +1005,21 @@ async function handleAdminRequest(request, url, env) {
       return jsonResponse({ error: errText }, resp.status, cors);
     }
     return jsonResponse({ success: true, inserted: rows.length }, 200, cors);
+  }
+
+  // ── GET /api/admin/inbound ── 全量在途记录（供将来 Web 页扩展使用）
+  if (method === 'GET' && pathname === '/api/admin/inbound') {
+    const warehouse = url.searchParams.get('warehouse') || '';
+    const ean = url.searchParams.get('ean') || '';
+    let filter = 'order=eta.asc.nullslast';
+    if (warehouse) filter += `&warehouse=eq.${encodeURIComponent(warehouse)}`;
+    if (ean)       filter += `&ean=eq.${encodeURIComponent(ean)}`;
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inbound?select=ean,model,warehouse,inbound_qty,eta&${filter}`,
+      { headers }
+    );
+    const data = await resp.json();
+    return jsonResponse({ data, total: Array.isArray(data) ? data.length : 0 }, 200, cors);
   }
 
   return jsonResponse({ error: 'Not found' }, 404, cors);

@@ -1,42 +1,42 @@
 # AERONEX Cloudflare Workers
 
-Cloudflare Worker for the AERONEX inventory query system.
+本仓库用于维护 AERONEX 库存查询系统的 Cloudflare Worker。
 
-## Production
+## 生产环境
 
-- Worker name: `tools-inventory`
-- Production URL: `https://tools-inventory.magic-ying.workers.dev`
-- Main entry: `src/index.js`
-- Deploy config: `wrangler.toml`
-- Auto deploy: GitHub Actions, `.github/workflows/deploy.yml`
-- Default branch: `main`
+- Worker 名称：`tools-inventory`
+- 生产地址：`https://tools-inventory.magic-ying.workers.dev`
+- 主入口文件：`src/index.js`
+- 部署配置：`wrangler.toml`
+- 自动部署：GitHub Actions，`.github/workflows/deploy.yml`
+- 默认分支：`main`
 
-## Current Status
+## 当前状态
 
 ### 2026-06-10
 
-Completed Worker v2.6.0 deployment.
+已完成 Worker v2.6.0 部署。
 
-- Commit: `ff2ce13 Add public inventory search APIs`
-- Worker health check: `version: 2.6.0`
-- New public read-only APIs:
+- Commit：`ff2ce13 Add public inventory search APIs`
+- Worker 健康检查：`version: 2.6.0`
+- 新增公开只读 API：
   - `GET /api/public/products?limit=500`
   - `GET /api/public/search?ean=...`
   - `GET /api/public/search?keyword=...`
-- Purpose: allow the public query page to search inventory without exposing `X-Admin-Password` in frontend JavaScript.
-- Verification:
-  - `/api/public/products?limit=5` returned product data.
-  - `/api/public/search?keyword=Matrice` returned inventory rows.
-  - `/api/public/search` without query parameters returned `400`, as expected.
+- 目的：让公开库存查询页可以在不暴露 `X-Admin-Password` 的情况下查询库存。
+- 验证结果：
+  - `/api/public/products?limit=5` 可返回产品数据。
+  - `/api/public/search?keyword=Matrice` 可返回库存记录。
+  - `/api/public/search` 不带查询参数时返回 `400`，符合预期，避免全量拉取。
 
-Completed Cloudflare Pages frontend deployment.
+已完成 Cloudflare Pages 前端部署。
 
-- Pages project: `aeronex-inventory-search`
-- Production domain: `https://tools-inventory-search.aeronex.ae`
-- Deployment ID: `03f86b4c-a292-41b1-97a7-d6ded4dffab3`
-- Deployment URL: `https://03f86b4c.aeronex-inventory-search.pages.dev`
-- Source package: latest Genspark export from 2026-06-10.
-- Deployed frontend files only:
+- Pages 项目：`aeronex-inventory-search`
+- 生产域名：`https://tools-inventory-search.aeronex.ae`
+- Deployment ID：`03f86b4c-a292-41b1-97a7-d6ded4dffab3`
+- Deployment URL：`https://03f86b4c.aeronex-inventory-search.pages.dev`
+- 来源文件：2026-06-10 从 Genspark 下载的最新导出包。
+- 本次仅部署前端静态文件：
   - `index.html`
   - `admin.html`
   - `dashboard.html`
@@ -44,33 +44,33 @@ Completed Cloudflare Pages frontend deployment.
   - `css/`
   - `js/`
   - `images/`
-- Excluded backend, SQL, and documentation folders from Pages deployment:
+- 本次已排除不应公开部署的后端、SQL 和文档目录：
   - `github_repo/`
   - `lark_bot_repo/`
   - `sql/`
   - `README.md`
   - `KINGDEE-INTEGRATION-GUIDE.md`
-- Verification:
-  - `js/query.js` now uses `/api/public/products` and `/api/public/search`.
-  - `js/admin.js` no longer contains the hardcoded old admin password.
-  - Cache-busted checks confirmed `github_repo/index.js` and `README.md` no longer return the old public file contents.
+- 验证结果：
+  - `js/query.js` 已改为调用 `/api/public/products` 和 `/api/public/search`。
+  - `js/admin.js` 已移除旧的硬编码 Admin 密码。
+  - 使用 cache-busting 检查后，确认 `github_repo/index.js` 和 `README.md` 不再返回旧的公开文件内容。
 
-## Required Operating Rule
+## 必须遵守的操作规则
 
-After every implementation, deployment, migration, or verification stage, update this README before considering the stage complete.
+每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新本 README，然后才能认为该阶段完成。
 
-Each update should include:
+每次 README 更新应包含：
 
-- Date.
-- Stage completed.
-- Files or systems changed.
-- Deployment target, if any.
-- Verification performed.
-- Known risks or follow-up items.
+- 日期。
+- 已完成的阶段。
+- 变更的文件或系统。
+- 部署目标，如有。
+- 已完成的验证。
+- 已知风险或后续事项。
 
-## Known Follow-Ups
+## 已知后续事项
 
-- Frontend Pages currently does not have a dedicated GitHub repository. The latest deployment was done by direct Cloudflare Pages upload from a local curated static directory.
-- Consider moving frontend Pages source into GitHub for version control and repeatable deployments.
-- Review admin frontend session behavior: `js/admin.js` stores only login state in `sessionStorage` while the password is kept in memory. After page refresh, the page may appear logged in while API calls fail until the user logs in again.
-- Consider rotating the old admin password because it was previously exposed in frontend JavaScript.
+- 前端 Cloudflare Pages 目前还没有独立 GitHub 仓库。本次前端是从本地整理后的静态目录直接上传到 Cloudflare Pages。
+- 建议后续将前端 Pages 源码纳入 GitHub，方便版本管理和可重复部署。
+- 需要复查 Admin 前端登录状态逻辑：`js/admin.js` 只把登录状态存在 `sessionStorage`，密码只保存在内存中。页面刷新后，可能出现界面看似已登录，但 API 请求因内存密码丢失而失败的情况。
+- 建议轮换旧 Admin 密码，因为旧密码曾经被硬编码在前端 JavaScript 中。

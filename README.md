@@ -55,6 +55,23 @@
   - `js/admin.js` 已移除旧的硬编码 Admin 密码。
   - 使用 cache-busting 检查后，确认 `github_repo/index.js` 和 `README.md` 不再返回旧的公开文件内容。
 
+### 2026-06-11
+
+已完成线上前端回归验证。
+
+- 验证范围：
+  - Cloudflare Pages 自定义域名：`https://tools-inventory-search.aeronex.ae`
+  - Cloudflare Worker public API：`https://tools-inventory.magic-ying.workers.dev`
+- 验证结果：
+  - 查询页首页返回 `200`，可正常加载。
+  - `js/query.js` 返回 `200`，并确认调用 `/api/public/products` 与 `/api/public/search`。
+  - `js/query.js` 未再包含旧的 `ADMIN_PASSWORD` 或 `Dji@2026`。
+  - `/api/public/products?limit=2` 可返回 `{ data: [...] }` 格式的产品列表。
+  - `/api/public/search?keyword=Matrice` 可返回 `{ data: [...] }` 格式的库存记录。
+  - `github_repo/index.js` 与 `README.md` 在 Pages 域名下不再暴露源文件内容，而是回落到前端入口页。
+- 已知限制：
+  - 本机内置浏览器自动化检查受 Windows sandbox 限制中断，本阶段使用线上 HTTP、静态资源与 API 响应完成回归验证。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。

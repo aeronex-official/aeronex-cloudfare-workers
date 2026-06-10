@@ -72,6 +72,20 @@
 - 已知限制：
   - 本机内置浏览器自动化检查受 Windows sandbox 限制中断，本阶段使用线上 HTTP、静态资源与 API 响应完成回归验证。
 
+已完成 Supabase public API 暴露边界只读复核。
+
+- Worker v2.6.0 public API：
+  - `/api/public/products`
+  - `/api/public/search`
+- 当前 public API 只查询 Supabase `inventory` 表。
+- 返回字段限于 `ean`、`model`、`warehouse`、`available_qty`。
+- `/api/public/products` 限制 `limit <= 500`。
+- `/api/public/search` 限制 `limit=100`，且必须提供 `ean` 或 `keyword`。
+- Supabase 只读盘点发现：
+  - `inventory` 对 `anon` 可见 316 行，符合公开查询页需求。
+  - `inventory_snapshots` 与 `sales_records` 也存在 anon 可读数据，超出 Worker public API 当前设计范围，建议后续通过数据库迁移收紧。
+  - `public.rls_auto_enable()` 为 `SECURITY DEFINER` 函数且 anon/authenticated 可执行，建议后续撤销公开执行权限。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。

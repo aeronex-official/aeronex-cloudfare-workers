@@ -25,6 +25,11 @@
  *   2.3.0 - 新增金蝶 B2B 只读 API（/api/inventory 单条查询、/api/inventory/batch 批量查询）
  *           通过 X-API-Key 请求头验证身份，密钥存储于 Supabase api_keys 表
  *           verifyApiKey() 验证合法性并自动更新 last_used_at，支持随时禁用密钥
+ *   2.6.0 - 安全加固：新增 /api/public/search 只读接口（无需密码）
+ *           - 供查询页前端使用，替代直接暴露 Admin API 密码
+ *           - 按关键词/EAN 搜索，强制 limit≤100，禁止全量拉取（无 keyword 时返回 400）
+ *           - /api/public/products 返回产品名称+EAN列表（用于自动补全），limit≤500
+ *           - Admin API 密码不再硬编码于前端 JS，改为用户登录时输入存入内存
  *   2.5.0 - 新增在途库存（Inbound）查询支持：
  *           - fetchInboundByEan() 按 EAN 查询 inbound 表，返回各仓在途记录
  *           - formatProductDetail() 升级：附加在途数量 + ETA（🚢图标）
@@ -45,7 +50,7 @@
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 
 // 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
 function toDubaiTime(date) {
@@ -870,6 +875,83 @@ async function handleB2bRequest(request, url, env) {
 }
 
 // ============================================================
+// Public 只读 API（无需密码，供查询页前端使用）
+// ============================================================
+
+async function handlePublicRequest(request, url, env) {
+  const origin = request.headers.get('Origin') || '*';
+  const cors = corsHeaders(origin);
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: cors });
+  }
+
+  const supabaseUrl = env.SUPABASE_URL;
+  const supabaseKey = env.SUPABASE_SECRET_KEY;
+  const headers = getSupabaseHeaders(supabaseKey);
+  const pathname = url.pathname;
+
+  // ── GET /api/public/products ──
+  // 返回去重产品列表（ean + model），用于搜索框自动补全
+  // 强制 limit ≤ 500，不返回库存数量
+  if (request.method === 'GET' && pathname === '/api/public/products') {
+    const rawLimit = parseInt(url.searchParams.get('limit') || '500');
+    const limit = Math.min(rawLimit, 500);
+
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?select=ean,model&order=model.asc&limit=${limit}`,
+      { headers }
+    );
+    if (!resp.ok) return jsonResponse({ error: 'Failed to fetch products' }, 500, cors);
+
+    const rows = await resp.json();
+    if (!Array.isArray(rows)) return jsonResponse({ data: [] }, 200, cors);
+
+    // 按 EAN 去重，只返回 ean + model
+    const seen = new Map();
+    for (const r of rows) {
+      const ean = String(r.ean || '').trim();
+      if (ean && !seen.has(ean)) {
+        seen.set(ean, { ean, model: r.model || '' });
+      }
+    }
+    return jsonResponse({ data: Array.from(seen.values()) }, 200, cors);
+  }
+
+  // ── GET /api/public/search?keyword=...&ean=... ──
+  // 按关键词或 EAN 查询库存，必须提供 keyword 或 ean 参数
+  // 强制 limit ≤ 100，防止全量拉取
+  if (request.method === 'GET' && pathname === '/api/public/search') {
+    const keyword = (url.searchParams.get('keyword') || '').trim();
+    const ean     = (url.searchParams.get('ean') || '').trim();
+
+    // 必须提供搜索条件，禁止全量查询
+    if (!keyword && !ean) {
+      return jsonResponse({ error: 'keyword or ean parameter is required' }, 400, cors);
+    }
+
+    let filter = '';
+    if (ean) {
+      filter = `ean=eq.${encodeURIComponent(ean)}`;
+    } else {
+      const safe = keyword.replace(/[,()]/g, '');
+      filter = `or=(model.ilike.*${encodeURIComponent(safe)}*,ean.ilike.*${encodeURIComponent(safe)}*)`;
+    }
+
+    const resp = await fetch(
+      `${supabaseUrl}/rest/v1/inventory?select=ean,model,warehouse,available_qty&${filter}&limit=100&order=model.asc`,
+      { headers }
+    );
+    if (!resp.ok) return jsonResponse({ error: 'Failed to fetch inventory' }, 500, cors);
+
+    const rows = await resp.json();
+    return jsonResponse({ data: Array.isArray(rows) ? rows : [] }, 200, cors);
+  }
+
+  return jsonResponse({ error: 'Not found' }, 404, cors);
+}
+
+// ============================================================
 // Admin API 路由处理
 // ============================================================
 
@@ -1034,6 +1116,11 @@ export default {
     const url = new URL(request.url);
     const pathname = url.pathname;
     const origin = request.headers.get('Origin') || '*';
+
+    // ── Public 只读 API 路由（/api/public/*，无需密码）──
+    if (pathname.startsWith('/api/public/')) {
+      return handlePublicRequest(request, url, env);
+    }
 
     // ── Admin API 路由（/api/admin/*）──
     if (pathname.startsWith('/api/admin/')) {

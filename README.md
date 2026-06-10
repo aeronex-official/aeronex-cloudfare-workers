@@ -86,6 +86,19 @@
   - `inventory_snapshots` 与 `sales_records` 也存在 anon 可读数据，超出 Worker public API 当前设计范围，建议后续通过数据库迁移收紧。
   - `public.rls_auto_enable()` 为 `SECURITY DEFINER` 函数且 anon/authenticated 可执行，建议后续撤销公开执行权限。
 
+已执行 Supabase 安全收紧迁移。
+
+- 迁移记录：`aeronex-inventory-sync-/supabase/migrations/20260611_security_tightening.sql`
+- 已撤销 `anon` / `authenticated` 在 public schema 所有表上的非 SELECT 权限。
+- 已撤销 `public.rls_auto_enable()` 对 `public`、`anon`、`authenticated` 的执行权限。
+- 已验证：
+  - `public.rls_auto_enable()` 当前仅 `postgres` 与 `service_role` 可执行。
+  - Worker public API `/api/public/products` 与 `/api/public/search` 正常。
+  - Kingdee API `GET /api/inventory` 与 `POST /api/inventory/batch` 仍返回 `code=0`。
+- 保留项：
+  - `inventory_snapshots` 与 `sales_records` 暂时仍保留 `anon SELECT`，因为当前 `dashboard.html` 直接读取这两张表。
+  - 后续应先将 Dashboard 改为通过 Worker 后端读取，再移除这两张表的 anon read policy。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。

@@ -114,6 +114,10 @@
 - 本地验证：
   - `node --check src/index.js` 通过。
   - 小写 `dubai` / `saudi` 合并数量测试通过。
+- 线上验证：
+  - Worker health check 已返回 `version: 2.6.1`。
+  - `GET /api/inventory?ean=6941565994257` 返回 `code=0`，Dubai `597`，Saudi `117`，Total `714`。
+  - `POST /api/inventory/batch` 返回 `code=0`，首条 EAN `6941565994257`，Dubai `597`，Saudi `117`，Total `714`。
 
 ## 必须遵守的操作规则
 

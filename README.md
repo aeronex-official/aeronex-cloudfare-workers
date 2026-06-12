@@ -99,6 +99,22 @@
   - `inventory_snapshots` 与 `sales_records` 暂时仍保留 `anon SELECT`，因为当前 `dashboard.html` 直接读取这两张表。
   - 后续应先将 Dashboard 改为通过 Worker 后端读取，再移除这两张表的 anon read policy。
 
+### 2026-06-12
+
+已完成 Worker v2.6.1 金蝶 B2B API warehouse 大小写兼容修复。
+
+- 修改文件：`src/index.js`
+- 修复范围：
+  - `GET /api/inventory?ean=...`
+  - `POST /api/inventory/batch`
+- 修复内容：
+  - 原逻辑使用 `includes('Dubai')` / `includes('Saudi')` 做大小写敏感匹配。
+  - 当前 Supabase `inventory.warehouse` 实际为小写 `dubai` / `saudi` / `hk`。
+  - 已改为 `(row.warehouse || '').toLowerCase()` 后再匹配 `dubai` / `saudi`。
+- 本地验证：
+  - `node --check src/index.js` 通过。
+  - 小写 `dubai` / `saudi` 合并数量测试通过。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。

@@ -30,6 +30,9 @@
  *           - 按关键词/EAN 搜索，强制 limit≤100，禁止全量拉取（无 keyword 时返回 400）
  *           - /api/public/products 返回产品名称+EAN列表（用于自动补全），limit≤500
  *           - Admin API 密码不再硬编码于前端 JS，改为用户登录时输入存入内存
+ *   2.6.1 - 修复金蝶 B2B API 仓库匹配大小写兼容问题：
+ *           - /api/inventory 和 /api/inventory/batch 统一将 warehouse 转为小写后比较
+ *           - 兼容 sync v3.0+ 写入的 'dubai' / 'saudi' 小写仓库值
  *   2.5.0 - 新增在途库存（Inbound）查询支持：
  *           - fetchInboundByEan() 按 EAN 查询 inbound 表，返回各仓在途记录
  *           - formatProductDetail() 升级：附加在途数量 + ETA（🚢图标）
@@ -50,7 +53,7 @@
  */
 
 const LARK_BASE_URL = 'https://open.larksuite.com';
-const VERSION = '2.6.0';
+const VERSION = '2.6.1';
 
 // 将 UTC 时间转换为迪拜时间（UTC+4，GST - Gulf Standard Time）
 function toDubaiTime(date) {
@@ -776,8 +779,9 @@ async function handleB2bRequest(request, url, env) {
     let dubaiQty = null, saudiQty = null, model = '';
     for (const row of rows) {
       model = model || row.model || '';
-      if (row.warehouse && row.warehouse.includes('Dubai')) dubaiQty = row.available_qty ?? 0;
-      else if (row.warehouse && row.warehouse.includes('Saudi')) saudiQty = row.available_qty ?? 0;
+      const wh = (row.warehouse || '').toLowerCase();
+      if (wh.includes('dubai')) dubaiQty = row.available_qty ?? 0;
+      else if (wh.includes('saudi')) saudiQty = row.available_qty ?? 0;
     }
 
     return jsonResponse({
@@ -837,8 +841,9 @@ async function handleB2bRequest(request, url, env) {
         }
         const entry = map.get(key);
         if (!entry.model && row.model) entry.model = row.model;
-        if (row.warehouse && row.warehouse.includes('Dubai')) entry.dubai_qty = row.available_qty ?? 0;
-        else if (row.warehouse && row.warehouse.includes('Saudi')) entry.saudi_qty = row.available_qty ?? 0;
+        const wh = (row.warehouse || '').toLowerCase();
+        if (wh.includes('dubai')) entry.dubai_qty = row.available_qty ?? 0;
+        else if (wh.includes('saudi')) entry.saudi_qty = row.available_qty ?? 0;
       }
     }
 

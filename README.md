@@ -119,6 +119,25 @@
   - `GET /api/inventory?ean=6941565994257` 返回 `code=0`，Dubai `597`，Saudi `117`，Total `714`。
   - `POST /api/inventory/batch` 返回 `code=0`，首条 EAN `6941565994257`，Dubai `597`，Saudi `117`，Total `714`。
 
+### 2026-06-16
+
+已为 AERONEX Logistics 平台创建库存 API 集成 key。
+
+- 使用范围：
+  - `GET /api/inventory?ean=...`
+  - `POST /api/inventory/batch`
+- Supabase `api_keys.client_name`：`AERONEX Logistics Platform`
+- 状态：`active`
+- 验证结果：
+  - 使用新 key 调用单条接口返回 `code=0`。
+  - 使用新 key 调用批量接口返回 `code=0`。
+  - `last_used_at` 已更新，说明 Worker API key 校验链路正常。
+- 集成文档：
+  - `aeronex-inventory-sync-/docs/AERONEX_LOGISTICS_INVENTORY_API_GUIDE.md`
+- 安全要求：
+  - 真实 API key 不写入 Git 仓库。
+  - Logistics 平台必须在后端调用 Worker API，不允许前端浏览器直接携带 API key。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。

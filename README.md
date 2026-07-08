@@ -138,6 +138,25 @@
   - 真实 API key 不写入 Git 仓库。
   - Logistics 平台必须在后端调用 Worker API，不允许前端浏览器直接携带 API key。
 
+### 2026-07-08
+
+已为 Lark APP 库存查询创建独立 API key。
+
+- 使用范围：
+  - `GET /api/inventory?ean=...`
+  - `POST /api/inventory/batch`
+- Supabase `api_keys.client_name`：`AERONEX Lark APP Inventory Query`
+- 状态：`active`
+- 创建时间：2026-07-08 18:46:39 UTC
+- 验证结果：
+  - 使用新 key 调用单条接口返回 `code=0`。
+  - 使用新 key 调用批量接口返回 `code=0`，`total=2`。
+  - `last_used_at` 已更新为 2026-07-08 18:46:59 UTC，说明 Worker API key 校验链路正常。
+- 安全要求：
+  - 真实 API key 不写入 Git 仓库。
+  - Lark APP 应在服务端保存并调用 Worker API，不允许在前端页面、客户端日志、URL 或公开文档中暴露 API key。
+  - 后续停用时，将 Supabase `api_keys.status` 改为 `disabled`，保留审计记录。
+
 ## 必须遵守的操作规则
 
 每完成一个实现、部署、数据库迁移或验证阶段，都必须先更新 README，然后才能认为该阶段完成。
